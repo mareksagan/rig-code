@@ -1,0 +1,29 @@
+[package]
+name = "rig-code"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rig-core = { version = "0.35", features = ["derive"] }
+schemars = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+tokio = { version = "1.44", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+thiserror = "2.0"
+colored = "3.0"
+dialoguer = "0.11"
+indicatif = "0.17"
+chrono = "0.4"
+clap = { version = "4.5", features = ["derive"] }
+regex = "1.11"
+glob = "0.3"
+futures = "0.3"
+walkdir = "2.5"
+urlencoding = "2.1"
+strip-ansi-escapes = "0.2"
+async-trait = "0.1"
+is-terminal = "0.4.17"

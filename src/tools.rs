@@ -5,6 +5,7 @@ use is_terminal::IsTerminal;
 use regex::Regex;
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::Path;
@@ -12,6 +13,33 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+
+use crate::permissions::PermissionMode;
+
+// ────────────────────────────────
+// Tool permission metadata
+// ────────────────────────────────
+
+#[must_use]
+pub fn required_permission_for_tool(name: &str) -> PermissionMode {
+    match name {
+        "read_file" | "glob" | "grep" | "fetch_url" | "search_web" => PermissionMode::ReadOnly,
+        "write_file" | "str_replace_file" | "todo_list" => PermissionMode::WorkspaceWrite,
+        "shell" | "ask_user" | "plan_mode" | "agent" => PermissionMode::DangerFullAccess,
+        _ => PermissionMode::DangerFullAccess,
+    }
+}
+
+#[async_trait]
+pub trait SubagentSpawner: Send + Sync {
+    async fn spawn_subagent(
+        &self,
+        description: &str,
+        prompt: &str,
+        subagent_type: &str,
+        name: Option<&str>,
+    ) -> Result<String, ToolError>;
+}
 
 // ────────────────────────────────
 // Shared state
@@ -72,19 +100,6 @@ pub enum ToolError {
     Other(String),
 }
 
-fn is_destructive(cmd: &str) -> bool {
-    let destructive = [
-        "rm ", "rmdir ", "mv ", "dd ", "mkfs", "format",
-        "> ", ">> ", "|", "sed -i", "perl -pi",
-    ];
-    let lowered = cmd.to_lowercase();
-    destructive.iter().any(|d| lowered.contains(d))
-}
-
-fn auto_approve() -> bool {
-    std::env::var("RIG_CODE_AUTO_APPROVE").is_ok()
-}
-
 impl Tool for Shell {
     const NAME: &'static str = "shell";
     type Error = ToolError;
@@ -94,7 +109,7 @@ impl Tool for Shell {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: "shell".to_string(),
-            description: "Execute a bash shell command. Use this to run commands, explore the filesystem, build/test code, etc.".to_string(),
+            description: "Execute a bash shell command. Use this to run commands, explore the filesystem, build/test code, etc. Destructive commands require the appropriate permission mode.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -114,24 +129,6 @@ impl Tool for Shell {
         } else {
             args.description.clone()
         };
-
-        if is_destructive(&args.command) && !auto_approve() {
-            println!("{}", format!("⚠️  Destructive command: {}", args.command).yellow().bold());
-            if std::io::stdin().is_terminal() {
-                let confirmed = Confirm::new()
-                    .with_prompt("Execute this command?")
-                    .default(false)
-                    .interact()
-                    .map_err(|e: dialoguer::Error| ToolError::Io(e.to_string()))?;
-                if !confirmed {
-                    return Err(ToolError::Cancelled);
-                }
-            } else {
-                return Err(ToolError::Other(
-                    "Destructive command requires terminal for confirmation. Run in interactive mode or set RIG_CODE_AUTO_APPROVE=1.".to_string()
-                ));
-            }
-        }
 
         println!("{} {}", "▶".blue().bold(), cmd_desc.dimmed());
 
@@ -286,7 +283,7 @@ impl Tool for WriteFile {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: "write_file".to_string(),
-            description: "Write or append content to a file. ALWAYS confirm with user before overwriting existing files.".to_string(),
+            description: "Write or append content to a file. Overwrites require the appropriate permission mode.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -301,24 +298,6 @@ impl Tool for WriteFile {
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let path = Path::new(&args.path);
-
-        if path.exists() && !args.append && !auto_approve() {
-            println!("{}", format!("⚠️  File already exists: {}", args.path).yellow().bold());
-            if std::io::stdin().is_terminal() {
-                let confirmed = Confirm::new()
-                    .with_prompt("Overwrite this file?")
-                    .default(false)
-                    .interact()
-                    .map_err(|e: dialoguer::Error| ToolError::Io(e.to_string()))?;
-                if !confirmed {
-                    return Err(ToolError::Cancelled);
-                }
-            } else {
-                return Err(ToolError::Other(
-                    "File overwrite requires terminal for confirmation. Run in interactive mode or set RIG_CODE_AUTO_APPROVE=1.".to_string()
-                ));
-            }
-        }
 
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent)
@@ -395,27 +374,7 @@ impl Tool for StrReplaceFile {
         }
 
         let occurrences = content.matches(&args.old).count();
-        if occurrences > 1 {
-            println!("{}", format!("⚠️  Found {} occurrences of the old string in {}", occurrences, args.path).yellow());
-            if auto_approve() {
-                // proceed without confirmation
-            } else if std::io::stdin().is_terminal() {
-                let confirmed = Confirm::new()
-                    .with_prompt("Replace ALL occurrences?")
-                    .default(false)
-                    .interact()
-                    .map_err(|e: dialoguer::Error| ToolError::Io(e.to_string()))?;
-                if !confirmed {
-                    return Err(ToolError::Cancelled);
-                }
-            } else {
-                return Err(ToolError::Other(
-                    "Multi-occurrence replace requires terminal for confirmation.".to_string()
-                ));
-            }
-        } else {
-            println!("{}", format!("📝 Editing {}", args.path).cyan());
-        }
+        println!("{}", format!("📝 Editing {}", args.path).cyan());
 
         let new_content = content.replace(&args.old, &args.new);
         tokio::fs::write(path, new_content)
@@ -921,4 +880,103 @@ impl Tool for PlanModeTool {
             _ => Err(ToolError::Other(format!("Unknown action: {}", args.action))),
         }
     }
+}
+
+// ────────────────────────────────
+// Agent Tool (subagent)
+// ────────────────────────────────
+
+#[derive(Clone)]
+pub struct AgentTool<S: SubagentSpawner> {
+    pub spawner: Arc<S>,
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+pub struct AgentArgs {
+    pub description: String,
+    pub prompt: String,
+    #[serde(default)]
+    pub subagent_type: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+impl<S: SubagentSpawner> Tool for AgentTool<S> {
+    const NAME: &'static str = "agent";
+    type Error = ToolError;
+    type Args = AgentArgs;
+    type Output = String;
+
+    async fn definition(&self, _prompt: String) -> ToolDefinition {
+        ToolDefinition {
+            name: "agent".to_string(),
+            description: "Delegate a task to a specialized sub-agent and receive handoff metadata.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "description": { "type": "string", "description": "Short task description" },
+                    "prompt": { "type": "string", "description": "Full prompt for the sub-agent" },
+                    "subagent_type": { "type": "string", "description": "Explore, Plan, Verification, or general-purpose" },
+                    "name": { "type": "string", "description": "Optional human-readable task name" }
+                },
+                "required": ["description", "prompt"]
+            }),
+        }
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        if args.description.trim().is_empty() || args.prompt.trim().is_empty() {
+            return Err(ToolError::Other(
+                "agent tool requires non-empty description and prompt".to_string(),
+            ));
+        }
+
+        let subagent_type = normalize_subagent_type(args.subagent_type.as_deref());
+        self.spawner
+            .spawn_subagent(
+                &args.description,
+                &args.prompt,
+                &subagent_type,
+                args.name.as_deref(),
+            )
+            .await
+    }
+}
+
+fn normalize_subagent_type(subagent_type: Option<&str>) -> String {
+    let trimmed = subagent_type.map(str::trim).unwrap_or_default();
+    if trimmed.is_empty() {
+        return String::from("general-purpose");
+    }
+
+    match trimmed.to_ascii_lowercase().replace(['-', '_', ' '], "").as_str() {
+        "general" | "generalpurpose" => String::from("general-purpose"),
+        "explore" | "explorer" => String::from("Explore"),
+        "plan" => String::from("Plan"),
+        "verification" | "verify" | "verifier" => String::from("Verification"),
+        _ => trimmed.to_string(),
+    }
+}
+
+#[must_use]
+pub fn allowed_tools_for_subagent(subagent_type: &str) -> std::collections::HashSet<String> {
+    let tools: Vec<&str> = match subagent_type {
+        "Explore" => vec![
+            "read_file", "glob", "grep", "search_web", "fetch_url",
+        ],
+        "Plan" => vec![
+            "read_file", "glob", "grep", "search_web", "fetch_url", "todo_list",
+        ],
+        "Verification" => vec![
+            "shell", "read_file", "glob", "grep", "search_web", "fetch_url", "todo_list",
+        ],
+        _ => vec![
+            "shell", "read_file", "write_file", "str_replace_file", "glob", "grep",
+            "search_web", "fetch_url", "todo_list", "ask_user",
+        ],
+    };
+    tools
+        .into_iter()
+        .map(String::from)
+        .collect::<std::collections::HashSet<_>>()
 }
